@@ -1,0 +1,22 @@
+[package]
+name = "search-rs"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [".", "entity", "migration"]
+
+[dependencies]
+entity = { path = "entity" }
+migration = { path = "migration" }
+anyhow = "1.0.98"
+fastembed = "4.7.0"
+sea-orm = { version = "1.1.10", features = [
+  "postgres-vector",
+  "sqlx-postgres",
+  "runtime-tokio-rustls",
+] }
+tokio = { version = "1.44.2", features = ["full"] }
+clap = { version = "4.5.36", features = ["derive"] }
+serde = "1.0.219"
+url = { version = "2.5.4", features = ["serde"] }
