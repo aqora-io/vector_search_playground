@@ -2,13 +2,14 @@
 
 use sea_orm::entity::prelude::*;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "search")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub content: String,
-    pub vector: PgVector,
+    #[sea_orm(column_type = "custom(\"vector\")")]
+    pub vector: String, // Should be 'PgVector' without attribute macro
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
