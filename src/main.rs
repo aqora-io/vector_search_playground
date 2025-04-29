@@ -1,18 +1,19 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use elasticsearch::{
+    cat::CatIndicesParts,
+    http::transport::Transport,
+    indices::{IndicesCreateParts, IndicesExistsParts},
+    Elasticsearch, IndexParts, SearchParts,
+};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use once_cell::sync::Lazy;
-use qdrant_client::config::CompressionEncoding;
-use qdrant_client::qdrant::{
-    CreateCollectionBuilder, Distance, PointStruct, ScalarQuantizationBuilder, SearchParamsBuilder,
-    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
-};
-use qdrant_client::{Payload, Qdrant};
 use sea_orm::{
     prelude::PgVector, ActiveValue::Set, ConnectOptions, Database, EntityTrait, PaginatorTrait,
 };
-
 use serde::Serialize;
+use serde_json::json;
+use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_COLLECTION_NAME: &str = "search";
@@ -28,11 +29,11 @@ static EMBEDDER: Lazy<TextEmbedding> = Lazy::new(|| {
 #[derive(Args, Debug, Serialize, Clone)]
 pub struct CliArgs {
     #[arg(short = 'd', long, env = "DATABASE_URL")]
-    pub database_url: url::Url,
-    #[arg(short = 'q', long, env = "QDRANT_URL")]
-    pub qdrant_url: url::Url,
+    pub database_url: Url,
+    #[arg(short = 'e', long, env = "ELASTIC_URL")]
+    pub elastic_url: Url,
     #[arg(short = 't', long, default_value = "0.6")]
-    pub threashold: Option<f32>,
+    pub threshold: Option<f32>,
 }
 
 #[derive(Parser, Debug, Serialize)]
@@ -73,68 +74,78 @@ fn embed_batch<S: AsRef<str> + Send + Sync>(texts: Vec<S>) -> Result<Vec<Vec<f32
     EMBEDDER.embed(texts, Some(256))
 }
 
+async fn es_client(url: &Url) -> Result<Elasticsearch> {
+    let transport = Transport::single_node(url.as_str())?;
+    Ok(Elasticsearch::new(transport))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
     let db_conn = {
-        let connect_opts = ConnectOptions::from(args.cliargs.database_url);
+        let connect_opts = ConnectOptions::from(args.cliargs.database_url.clone());
         Database::connect(connect_opts).await?
     };
 
-    let client = Qdrant::from_url(args.cliargs.qdrant_url.as_str())
-        .compression(Some(CompressionEncoding::Gzip))
-        .build()?;
+    let es = es_client(&args.cliargs.elastic_url).await?;
 
     match args.commands {
         Commands::Collections => {
-            let collections = client.list_collections().await?;
-            println!("collections: {:?}", collections);
+            let cat = es
+                .cat()
+                .indices(CatIndicesParts::None)
+                .format("json")
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+            println!("indices: {cat:#}");
         }
         Commands::Create(create) => {
-            let collection_exist = client.collection_exists(DEFAULT_COLLECTION_NAME).await?;
+            let index_exists = es
+                .indices()
+                .exists(IndicesExistsParts::Index(&[DEFAULT_COLLECTION_NAME]))
+                .send()
+                .await?
+                .status_code()
+                .is_success();
 
-            if !collection_exist {
-                client
-                    .create_collection(
-                        CreateCollectionBuilder::new(DEFAULT_COLLECTION_NAME)
-                            .vectors_config(VectorParamsBuilder::new(MODEL_DIM, Distance::Cosine))
-                            .quantization_config(ScalarQuantizationBuilder::default()),
-                    )
+            if !index_exists {
+                es.indices()
+                    .create(IndicesCreateParts::Index(DEFAULT_COLLECTION_NAME))
+                    .body(json!({
+                        "settings": {"index": {"knn": true}},
+                        "mappings": {
+                            "properties": {
+                                "vector": {"type": "dense_vector", "dims": MODEL_DIM, "index": true, "similarity": "cosine"},
+                                "content": {"type": "text"}
+                            }
+                        }
+                    }))
+                    .send()
                     .await?;
             }
 
             let embedding = embed_batch(vec![&create.content])?.pop().unwrap();
             let uuid = Uuid::now_v7();
 
-            let payload: Payload = serde_json::json!(
-                {
-                    "id": uuid,
-                    "content": &create.content,
-                }
-            )
-            .try_into()
-            .unwrap();
-
-            let search = entity::search::ActiveModel {
+            let search_row = entity::search::ActiveModel {
                 id: Set(uuid),
                 vector: Set(PgVector::from(embedding.clone())),
-                content: Set(create.content),
+                content: Set(create.content.clone()),
             };
-            entity::search::Entity::insert(search)
+            entity::search::Entity::insert(search_row)
                 .exec(&db_conn)
                 .await?;
 
-            client
-                .upsert_points(UpsertPointsBuilder::new(
-                    DEFAULT_COLLECTION_NAME,
-                    vec![PointStruct::new(
-                        Uuid::now_v7().to_string(),
-                        embedding,
-                        payload,
-                    )],
-                ))
-                .await?;
+            es.index(IndexParts::IndexId(
+                DEFAULT_COLLECTION_NAME,
+                &uuid.to_string(),
+            ))
+            .body(json!({"vector": embedding, "content": &create.content}))
+            .send()
+            .await?;
 
             println!("done.");
         }
@@ -143,20 +154,28 @@ async fn main() -> Result<()> {
             println!("rows: {}", search_count);
         }
         Commands::Search(search) => {
-            let search_result = client
-                .search_points(
-                    SearchPointsBuilder::new(
-                        DEFAULT_COLLECTION_NAME,
-                        embed_batch(vec![&search.query])?.pop().unwrap(),
-                        search.top_k,
-                    )
-                    .params(SearchParamsBuilder::default().hnsw_ef(128)),
-                )
+            let query_vec = embed_batch(vec![&search.query])?.pop().unwrap();
+
+            let resp = es
+                .search(SearchParts::Index(&[DEFAULT_COLLECTION_NAME]))
+                .body(json!({
+                    "knn": {
+                        "field": "vector",
+                        "query_vector": query_vec,
+                        "k": search.top_k,
+                        "num_candidates": 100
+                    },
+                    "_source": {"includes": ["content"]}
+                }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
                 .await?;
 
-            println!("search matches: {:?}", search_result);
+            println!("matches: {resp:#}");
         }
     }
+
     db_conn.close().await?;
     Ok(())
 }
