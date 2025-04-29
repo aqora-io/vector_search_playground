@@ -23,13 +23,7 @@ impl MigrationTrait for Migration {
             .create_table(
                 Table::create()
                     .table(Search::Table)
-                    .col(
-                        ColumnDef::new(Search::Id)
-                            .integer()
-                            .not_null()
-                            .primary_key()
-                            .auto_increment(),
-                    )
+                    .col(ColumnDef::new(Search::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(Search::Content).string().not_null())
                     .col(ColumnDef::new(Search::Vector).vector(None).not_null())
                     .to_owned(),

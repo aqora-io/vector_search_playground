@@ -3,3 +3,4 @@ target
 .docker-target/**/*
 !.docker-target/.gitkeep
 .fastembed_cache/
+qdrant_data/
